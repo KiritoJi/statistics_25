@@ -1,0 +1,10 @@
+model:
+  name: lightgbm
+  params:
+    n_estimators: 2000
+    num_leaves: 31
+    learning_rate: 0.05
+    reg_lambda: 1.0
+    subsample: 0.8
+    colsample_bytree: 0.8
+    scale_pos_weight: auto

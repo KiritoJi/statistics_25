@@ -16,120 +16,120 @@ run_all_models.py
     5) 生成各模型测试集预测文件 submission_{model}.csv，并按 OOF PR-AUC 选出 submission_best.csv；
     6) 输出每模型 metrics_{model}.json 与综合 metrics_summary.json。
 """
+# -*- coding: utf-8 -*-
+"""
+main.py
+数智风控 - 多模型信用风险评估主程序
+---------------------------------
+统一流程：
+1️⃣ 读取配置与数据
+2️⃣ 执行各模型的 CV 训练与预测
+3️⃣ 输出评估指标与可视化结果
+4️⃣ 融合集成 (Weighted / Stacking)
+"""
+
 import os
-import sys
-import subprocess
-from typing import Dict, List
-import numpy as np
+import yaml
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# 字体（中文）
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC'] + plt.rcParams['font.sans-serif']
-
-# 依赖确保
-REQUIRED = [
-    'pandas','numpy','scikit-learn','imbalanced-learn','lightgbm','xgboost','catboost','shap','matplotlib','seaborn','openpyxl'
-]
-
-def ensure_deps():
-    for pkg in REQUIRED:
-        try:
-            __import__(pkg.replace('-', '_'))
-        except Exception:
-            subprocess.run([sys.executable, '-m', 'pip', 'install', pkg], check=True)
+from common.utils import save_json, make_dir
+from common.evaluation import (
+    plot_label_balance,
+    plot_model_comparison,
+    compute_metrics,
+)
+from models.logistic_woe import LogisticWOEModel
+from models.lightgbm_model import LightGBMModel
+from models.xgboost_model import XGBoostModel
+from models.catboost_model import CatBoostModel
+from models.extratrees_model import ExtraTreesModel
+from models.ensemble_blender import EnsembleBlender
 
 
+# =========================================================
+# 主函数入口
+# =========================================================
 def main():
-    ensure_deps()
-    os.makedirs('output', exist_ok=True)
-    # 读取数据
-    train_path = '训练数据集.xlsx'
-    test_path = '测试集.xlsx'
-    sub_sample_path = '提交样例.csv'
-    train_df = pd.read_excel(train_path, engine='openpyxl')
-    test_df = pd.read_excel(test_path, engine='openpyxl')
-    # 标签占比图
-    from common.evaluation import plot_label_balance, plot_model_comparison, save_json
-    y = train_df['target'].astype(int).values
-    plot_label_balance(y, 'output/fig_label_balance.png')
+    # -------------------------
+    # 读取配置
+    # -------------------------
+    cfg = yaml.safe_load(open("configs/base.yaml", "r", encoding="utf-8"))
+    train_path = cfg["data"]["train_path"]
+    test_path = cfg["data"]["test_path"]
+    target_col = cfg["data"]["target"]
+    out_dir = "output"
+    make_dir(out_dir)
 
-    # 运行各模型
-    from models.logistic_woe import LogisticWOEModel
-    from models.lightgbm_model import LightGBMModel
-    from models.xgboost_model import XGBoostModel
-    from models.catboost_model import CatBoostModel
-    from models.extratrees_model import ExtraTreesModel
+    # -------------------------
+    # 加载数据
+    # -------------------------
+    train_df = pd.read_excel(train_path) if train_path.endswith(".xlsx") else pd.read_csv(train_path)
+    test_df = pd.read_excel(test_path) if test_path.endswith(".xlsx") else pd.read_csv(test_path)
+    print(f"✅ 数据加载完成：train={train_df.shape}, test={test_df.shape}")
 
-    results: List[Dict] = []
-    oof_dict = {}
+    # -------------------------
+    # 标签分布可视化
+    # -------------------------
+    print("📊 绘制标签分布图...")
+    plot_label_balance(train_df, path=f"{out_dir}/label_balance.png")
 
-    # Logistic Regression（WOE + Platt）
+    # -------------------------
+    # 初始化模型
+    # -------------------------
+    print("🚀 初始化模型...")
     lr = LogisticWOEModel(encoder_type='woe', calibrate_method='sigmoid', use_smote=True)
-    r_lr = lr.run_cv(train_df, 'output')
-    sub_lr = lr.fit_predict_test(train_df, test_df, 'output')
-    results.append({'model':'logistic', **r_lr['result']})
-    oof_dict['logistic'] = {'oof': r_lr['oof_cal'], 'y': r_lr['y']}
+    lgb = LightGBMModel()
+    xgb = XGBoostModel()
+    cat = CatBoostModel()
+    etr = ExtraTreesModel()
 
-    # LightGBM（Isotonic）
-    lgbm = LightGBMModel()
-    r_lgb = lgbm.run_cv(train_df, 'output')
-    sub_lgb = lgbm.fit_predict_test(train_df, test_df, 'output')
-    results.append({'model':'lightgbm', **r_lgb['result']})
-    oof_dict['lightgbm'] = {'oof': r_lgb['oof_cal'], 'y': r_lgb['y']}
+    # -------------------------
+    # 执行各模型交叉验证
+    # -------------------------
+    print("🔁 开始交叉验证...")
+    results = {}
+    results["LogisticWOE"] = lr.run_cv(train_df, out_dir)
+    results["LightGBM"] = lgb.run_cv(train_df, out_dir)
+    results["XGBoost"] = xgb.run_cv(train_df, out_dir)
+    results["CatBoost"] = cat.run_cv(train_df, out_dir)
+    results["ExtraTrees"] = etr.run_cv(train_df, out_dir)
 
-    # XGBoost（Isotonic）
-    xgbm = XGBoostModel()
-    r_xgb = xgbm.run_cv(train_df, 'output')
-    sub_xgb = xgbm.fit_predict_test(train_df, test_df, 'output')
-    results.append({'model':'xgboost', **r_xgb['result']})
-    oof_dict['xgboost'] = {'oof': r_xgb['oof_cal'], 'y': r_xgb['y']}
+    # -------------------------
+    # 汇总指标并可视化
+    # -------------------------
+    summary_df = pd.DataFrame([
+        {"model": k, **v["result"]} for k, v in results.items()
+    ])
+    summary_path = f"{out_dir}/summary_metrics.csv"
+    summary_df.to_csv(summary_path, index=False)
+    print(f"📈 模型评估结果已保存到：{summary_path}")
 
-    # CatBoost（Isotonic）
-    cbm = CatBoostModel()
-    r_cb = cbm.run_cv(train_df, 'output')
-    sub_cb = cbm.fit_predict_test(train_df, test_df, 'output')
-    results.append({'model':'catboost', **r_cb['result']})
-    oof_dict['catboost'] = {'oof': r_cb['oof_cal'], 'y': r_cb['y']}
+    plot_model_comparison(summary_df, f"{out_dir}/model_comparison.png")
 
-    # ExtraTrees（Isotonic）
-    etm = ExtraTreesModel()
-    r_et = etm.run_cv(train_df, 'output')
-    sub_et = etm.fit_predict_test(train_df, test_df, 'output')
-    results.append({'model':'extratrees', **r_et['result']})
-    oof_dict['extratrees'] = {'oof': r_et['oof_cal'], 'y': r_et['y']}
+    # -------------------------
+    # 模型融合（集成）
+    # -------------------------
+    print("🤖 集成融合中...")
+    weights = cfg["model"]["ensemble_weights"]
+    method = cfg["model"]["blend_method"]
 
-    # 汇总指标（按校准后）
-    rows = []
-    for r in results:
-        m = r['metrics_calibrated']
-        rows.append({'model': r['model'], 'pr_auc': m['pr_auc'], 'auc': m['auc'], 'brier': m['brier'],
-                     'best_threshold': r['best_threshold_f2']['threshold'], 'precision': r['best_threshold_f2']['precision'],
-                     'recall': r['best_threshold_f2']['recall'], 'f2': r['best_threshold_f2']['fbeta']})
-    summary_df = pd.DataFrame(rows)
-    summary_df.to_json('output/metrics_summary.json', orient='records')
-    plot_model_comparison(summary_df, 'output/fig_model_comparison.png')
+    oof_preds = [v["oof_cal"] for v in results.values()]
+    y_true = list(results.values())[0]["y"]
 
-    # 选最优模型（PR-AUC 最大）
-    best_model = summary_df.sort_values('pr_auc', ascending=False)['model'].iloc[0]
-    model_to_file = {
-        'logistic': 'output/submission_logistic.csv',
-        'lightgbm': 'output/submission_lightgbm.csv',
-        'xgboost': 'output/submission_xgboost.csv',
-        'catboost': 'output/submission_catboost.csv',
-        'extratrees': 'output/submission_extratrees.csv'
-    }
-    best_path = model_to_file[best_model]
-    best_df = pd.read_csv(best_path)
-    # 对齐提交样例的列名与顺序
-    best_df = best_df[['id','target']]
-    best_df.to_csv('output/submission_best.csv', index=False)
+    blender = EnsembleBlender(weights=weights, method=method)
+    blended = blender.run(oof_preds, oof_preds, y_true=y_true)
 
-    print('完成。最优模型：', best_model)
-    print('最优提交文件：output/submission_best.csv')
+    metrics_final = compute_metrics(y_true, blended)
+    save_json(metrics_final, f"{out_dir}/metrics_blend.json")
 
-if __name__ == '__main__':
+    print("✅ 融合完成，最终指标：")
+    print(metrics_final)
+
+    print("\n🎉 全流程完成！结果已输出至 output 目录。")
+
+
+# =========================================================
+# 主程序执行
+# =========================================================
+if __name__ == "__main__":
     main()
-

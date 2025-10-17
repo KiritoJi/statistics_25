@@ -1,0 +1,14 @@
+data:
+  train_path: "训练数据集.xlsx"
+  test_path: "测试集.xlsx"
+  target: "target"
+
+training:
+  n_folds: 5
+  random_state: 42
+  metrics: ["pr_auc", "auc", "brier", "ks", "mcc"]
+
+model:
+  calibration: "isotonic"
+  ensemble_weights: [0.25, 0.25, 0.25, 0.15, 0.10]
+  blend_method: "weighted"

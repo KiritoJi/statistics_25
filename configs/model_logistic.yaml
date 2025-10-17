@@ -1,0 +1,6 @@
+model:
+  name: logistic
+  params:
+    encoder_type: "woe"
+    use_smote: true
+    calibrate_method: "sigmoid"

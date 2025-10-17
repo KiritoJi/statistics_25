@@ -9,109 +9,128 @@ models/xgboost_model.py
 - 概率校准：Isotonic（默认）
 - 5 折分层交叉验证，输出 OOF 指标与特征重要性图
 """
-from typing import Dict
+# -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
+from typing import Dict, List
 from sklearn.model_selection import StratifiedKFold
 from sklearn.calibration import CalibratedClassifierCV
+from common.preprocess import Preprocessor
+from common.evaluation import compute_metrics
+from common.utils import save_json
 import xgboost as xgb
 
-from common.preprocess import Preprocessor, LabelEncoderWrapper
-from common.evaluation import compute_metrics, find_best_threshold_fbeta, plot_calibration, plot_feature_importance, save_json
+
+class _SimpleLabelEncoder:
+    """Per-column label encoder for tree models. Unseen -> -1."""
+    def __init__(self, cols: List[str]):
+        self.cols = cols
+        self.maps: Dict[str, Dict[str, int]] = {}
+
+    def fit(self, X: pd.DataFrame):
+        for c in self.cols:
+            cats = pd.Series(X[c].astype(str).fillna("未知").unique())
+            self.maps[c] = {v: i for i, v in enumerate(cats)}
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        Xt = X.copy()
+        for c in self.cols:
+            m = self.maps.get(c, {})
+            Xt[c] = Xt[c].astype(str).fillna("未知").map(lambda v: m.get(v, -1)).astype(int)
+        return Xt
+
 
 class XGBoostModel:
     def __init__(self, random_state: int = 42):
         self.random_state = random_state
-        self.feature_names_: list = []
 
-    def run_cv(self, train_df: pd.DataFrame, out_dir: str) -> Dict:
+    def _encode_cat(self, Xtr: pd.DataFrame, Xva: pd.DataFrame, cat_cols: List[str]):
+        enc = _SimpleLabelEncoder(cat_cols).fit(Xtr)
+        return enc.transform(Xtr), enc.transform(Xva)
+
+    def run_cv(self, train_df: pd.DataFrame, out_dir: str):
         df = train_df.copy()
-        y = df['target'].astype(int).values
+        y = df["target"].astype(int).values
         cat_cols, num_cols = Preprocessor.suggest_columns(df)
-        pre = Preprocessor(cat_cols=cat_cols, num_cols=[c for c in num_cols if c != 'target'])
+
+        pre = Preprocessor(cat_cols, num_cols)
         pre.fit(df)
-        dfp = pre.transform(df)
-        feat_cols = [c for c in dfp.columns if c != 'target']
-        self.feature_names_ = feat_cols
-        X = dfp[feat_cols]
+        X = pre.transform(df).drop(columns=["target"])
+
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.random_state)
-        oof_raw = np.zeros(len(df))
-        oof_cal = np.zeros(len(df))
-        for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
-            X_tr, X_va = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
-            y_tr, y_va = y[tr_idx], y[va_idx]
-            le = LabelEncoderWrapper(cols=cat_cols)
-            le.fit(X_tr)
-            X_tr_enc = le.transform(X_tr)
-            X_va_enc = le.transform(X_va)
-            pos = (y_tr==1).sum(); neg = (y_tr==0).sum(); spw = float(neg)/(pos+1e-6)
-            model = xgb.XGBClassifier(
-                n_estimators=2000,
+        oof = np.zeros(len(df))
+
+        for tr_idx, va_idx in skf.split(X, y):
+            Xtr, Xva = X.iloc[tr_idx].copy(), X.iloc[va_idx].copy()
+            ytr, yva = y[tr_idx], y[va_idx]
+
+            # encode categoricals
+            Xtr_enc, Xva_enc = self._encode_cat(Xtr, Xva, [c for c in cat_cols if c in X.columns])
+
+            pos, neg = (ytr == 1).sum(), (ytr == 0).sum()
+            spw = neg / (pos + 1e-6)
+
+            base = xgb.XGBClassifier(
+                n_estimators=1500,
                 learning_rate=0.05,
                 max_depth=4,
                 subsample=0.8,
                 colsample_bytree=0.8,
                 reg_lambda=1.0,
-                objective='binary:logistic',
-                tree_method='hist',
-                random_state=self.random_state,
+                objective="binary:logistic",
+                tree_method="hist",
                 n_jobs=-1,
+                random_state=self.random_state,
                 scale_pos_weight=spw,
-                eval_metric='auc'
+                eval_metric="auc",
             )
-            model.fit(X_tr_enc, y_tr,
-                      eval_set=[(X_va_enc, y_va)])
-            oof_raw[va_idx] = model.predict_proba(X_va_enc)[:, 1]
-            cal = CalibratedClassifierCV(estimator=model, method='isotonic', cv=3)
-            cal.fit(X_tr_enc, y_tr)
-            oof_cal[va_idx] = cal.predict_proba(X_va_enc)[:, 1]
-        metrics_raw = compute_metrics(y, oof_raw)
-        metrics_cal = compute_metrics(y, oof_cal)
-        best = find_best_threshold_fbeta(y, oof_cal, beta=2.0)
-        plot_calibration(y, oof_raw, oof_cal,
-                         out_path=f"{out_dir}/fig_calibration_xgboost.png",
-                         title='XGBoost 概率校准曲线（前后对比）')
-        # 特征重要性（全量拟合）
-        le_full = LabelEncoderWrapper(cols=cat_cols)
-        le_full.fit(X)
-        X_full = le_full.transform(X)
-        pos = (y==1).sum(); neg = (y==0).sum(); spw = float(neg)/(pos+1e-6)
-        model_full = xgb.XGBClassifier(n_estimators=1000, learning_rate=0.05, max_depth=4,
-                                       subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-                                       objective='binary:logistic', tree_method='hist',
-                                       random_state=self.random_state, n_jobs=-1, scale_pos_weight=spw)
-        model_full.fit(X_full, y)
-        imp = pd.DataFrame({'feature': self.feature_names_, 'importance': model_full.feature_importances_.astype(float)})
-        plot_feature_importance(imp, f"{out_dir}/fig_feature_importance_xgboost.png", title='XGBoost 特征重要性')
-        result = {
-            'model': 'xgboost',
-            'metrics_raw': metrics_raw,
-            'metrics_calibrated': metrics_cal,
-            'best_threshold_f2': best
-        }
-        save_json(result, f"{out_dir}/metrics_xgboost.json")
-        return {'oof_raw': oof_raw, 'oof_cal': oof_cal, 'y': y, 'result': result}
+            # unified calibration
+            cal = CalibratedClassifierCV(base, method="isotonic", cv=3)
+            cal.fit(Xtr_enc, ytr)
+            oof[va_idx] = cal.predict_proba(Xva_enc)[:, 1]
+
+        metrics = compute_metrics(y, oof)
+        save_json(metrics, f"{out_dir}/metrics_xgboost.json")
+        return {"oof_cal": oof, "y": y, "result": metrics}
 
     def fit_predict_test(self, train_df: pd.DataFrame, test_df: pd.DataFrame, out_dir: str) -> str:
-        df = train_df.copy(); y = df['target'].astype(int).values
+        df = train_df.copy()
+        y = df["target"].astype(int).values
         cat_cols, num_cols = Preprocessor.suggest_columns(df)
-        pre = Preprocessor(cat_cols=cat_cols, num_cols=[c for c in num_cols if c != 'target'])
+
+        pre = Preprocessor(cat_cols, num_cols)
         pre.fit(df)
-        dfp = pre.transform(df)
-        testp = pre.transform(test_df)
-        feat_cols = [c for c in dfp.columns if c != 'target']
-        le = LabelEncoderWrapper(cols=cat_cols)
-        le.fit(dfp[feat_cols])
-        X_full = le.transform(dfp[feat_cols])
-        X_test = le.transform(testp[feat_cols])
-        pos = (y==1).sum(); neg = (y==0).sum(); spw = float(neg)/(pos+1e-6)
-        model = xgb.XGBClassifier(n_estimators=1500, learning_rate=0.05, max_depth=4,
-                                  subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
-                                  objective='binary:logistic', tree_method='hist', random_state=self.random_state, n_jobs=-1, scale_pos_weight=spw)
-        cal = CalibratedClassifierCV(estimator=model, method='isotonic', cv=5)
-        cal.fit(X_full, y)
-        proba = cal.predict_proba(X_test)[:, 1]
-        sub = pd.DataFrame({'id': test_df['id'].astype(int), 'target': proba})
-        sub_path = f"{out_dir}/submission_xgboost.csv"
-        sub.to_csv(sub_path, index=False)
-        return sub_path
+        X = pre.transform(df).drop(columns=["target"])
+        T = pre.transform(test_df)
+
+        # encode categoricals with train fit
+        enc = _SimpleLabelEncoder([c for c in cat_cols if c in X.columns]).fit(X)
+        X_enc = enc.transform(X)
+        T_enc = enc.transform(T)
+
+        pos, neg = (y == 1).sum(), (y == 0).sum()
+        spw = neg / (pos + 1e-6)
+
+        base = xgb.XGBClassifier(
+            n_estimators=1500,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=1.0,
+            objective="binary:logistic",
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=self.random_state,
+            scale_pos_weight=spw,
+            eval_metric="auc",
+        )
+        cal = CalibratedClassifierCV(base, method="isotonic", cv=5)
+        cal.fit(X_enc, y)
+        p = cal.predict_proba(T_enc)[:, 1]
+
+        sub = pd.DataFrame({"id": test_df["id"], "target": p})
+        path = f"{out_dir}/submission_xgboost.csv"
+        sub.to_csv(path, index=False)
+        return path
